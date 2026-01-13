@@ -1,0 +1,26 @@
+# Build products
+*.app
+build/
+DerivedData/
+*.xcuserstate
+
+# Binary files
+ei-kana-test
+
+# Xcode
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Claude Code local settings
+.claude/
+
+# Temporary files
+*.swp
+*.swo
+*~
