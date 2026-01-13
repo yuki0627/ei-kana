@@ -14,7 +14,7 @@ macOS用の英数/かな切り替えアプリ。左右のCommandキー単体押�
 
 ### ビルド済みアプリ
 
-[Releases](https://github.com/yuki/ei-kana/releases) からダウンロード
+[Releases](https://github.com/yuki0627/ei-kana/releases/) からダウンロード
 
 ### ソースからビルド
 
