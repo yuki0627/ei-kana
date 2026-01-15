@@ -127,7 +127,7 @@ class KeyboardMonitor: ObservableObject {
     }
 
     private func switchToJapanese() {
-        switchToInputSource("Kotoeri.RomajiTyping.Japanese")
+        switchToInputSource("Japanese")
     }
 
     private func switchToInputSource(_ targetID: String) {
@@ -137,6 +137,12 @@ class KeyboardMonitor: ObservableObject {
         }
 
         for source in sources {
+            // 選択可能なソースのみ対象
+            if let selectablePtr = TISGetInputSourceProperty(source, kTISPropertyInputSourceIsSelectCapable) {
+                let selectable = Unmanaged<CFBoolean>.fromOpaque(selectablePtr).takeUnretainedValue() == kCFBooleanTrue
+                if !selectable { continue }
+            }
+
             if let sourceID = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) {
                 let id = Unmanaged<CFString>.fromOpaque(sourceID).takeUnretainedValue() as String
                 if id.contains(targetID) {
