@@ -10,7 +10,8 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14
+    # ローカル開発環境の macOS バージョンと合わせる（SDK が異なると MenuBarExtra の外観が変わる）
+    runs-on: macos-26
 
     steps:
       - name: Checkout
