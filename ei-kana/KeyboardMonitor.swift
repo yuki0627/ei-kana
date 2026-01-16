@@ -199,9 +199,71 @@ class KeyboardMonitor: ObservableObject {
                 let id = Unmanaged<CFString>.fromOpaque(sourceID).takeUnretainedValue() as String
                 if id.contains(targetID) {
                     TISSelectInputSource(source)
+
+                    // CJKV言語の場合はワークアラウンドを適用（Electronアプリ対策）
+                    if isCJKV(targetID) {
+                        showTemporaryInputWindow()
+                    }
                     return
                 }
             }
+        }
+    }
+
+    // CJKV（中国語・日本語・韓国語・ベトナム語）かどうかを判定
+    private func isCJKV(_ sourceID: String) -> Bool {
+        return sourceID.contains("Japanese") ||
+               sourceID.contains("Chinese") ||
+               sourceID.contains("Korean") ||
+               sourceID.contains("Vietnamese")
+    }
+
+    // MARK: - TISSelectInputSource ワークアラウンド
+    //
+    // 本来は TISSelectInputSource を呼ぶだけでIMEが切り替わるべきだが、
+    // macOSのCarbon API（TISSelectInputSource）には既知のバグがあり、
+    // CJKV言語でElectronアプリ（Slack、LINEなど）にフォーカスがある場合、
+    // メニューバーのIME表示は変わるが実際の入力は切り替わらない。
+    //
+    // このワークアラウンドは一時的にウィンドウを表示してフォーカスを奪い、
+    // 「別アプリに移動して戻る」を人工的に再現することで問題を回避する。
+    //
+    // 参考:
+    // - macism: https://github.com/laishulu/macism
+    // - Karabiner-Elements Issue #1602: https://github.com/pqrs-org/Karabiner-Elements/issues/1602
+    // - 詳細: docs/electron-ime-sync-issue.md
+    //
+    private var tempWindow: NSWindow?
+
+    private func showTemporaryInputWindow(waitTimeMs: Int = 50) {
+        // 前回のウィンドウがあれば閉じる
+        tempWindow?.orderOut(nil)
+        tempWindow = nil
+
+        // 画面外に小さなウィンドウを作成
+        let rect = NSRect(x: -100, y: -100, width: 1, height: 1)
+        let window = NSWindow(
+            contentRect: rect,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.level = .floating
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary]
+        window.isReleasedWhenClosed = false
+
+        tempWindow = window
+
+        // ウィンドウを表示（メニューバーアプリではactivateを呼ばない）
+        window.orderFrontRegardless()
+
+        // 指定時間後にウィンドウを非表示
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(waitTimeMs)) { [weak self] in
+            self?.tempWindow?.orderOut(nil)
+            self?.tempWindow = nil
         }
     }
 
