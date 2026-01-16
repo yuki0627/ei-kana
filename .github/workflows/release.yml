@@ -102,15 +102,21 @@ jobs:
           rm ei-kana.zip
           ditto -c -k --keepParent ei-kana.app ei-kana.zip
 
-      - name: Get version
+      - name: Get version and tag message
         id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        run: |
+          echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          git fetch --tags --force
+          TAG_MESSAGE=$(git tag -l --format='%(contents)' "${GITHUB_REF#refs/tags/}")
+          echo "TAG_MESSAGE<<EOF" >> $GITHUB_OUTPUT
+          echo "$TAG_MESSAGE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ steps.version.outputs.VERSION }}
           files: build/Build/Products/Release/ei-kana.zip
-          generate_release_notes: true
+          body: ${{ steps.version.outputs.TAG_MESSAGE }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
