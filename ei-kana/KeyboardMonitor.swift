@@ -110,10 +110,14 @@ class KeyboardMonitor: ObservableObject {
             lastKeyCode = keyCode
         } else {
             if lastKeyCode == keyCode {
-                if keyCode == leftCommandKeyCode {
-                    switchToEnglish()
-                } else {
-                    switchToJapanese()
+                // 非同期で切り替えを実行（イベントタップをブロックしないため）
+                let isLeftCommand = keyCode == leftCommandKeyCode
+                DispatchQueue.main.async { [weak self] in
+                    if isLeftCommand {
+                        self?.switchToEnglish()
+                    } else {
+                        self?.switchToJapanese()
+                    }
                 }
             }
             lastKeyCode = nil
