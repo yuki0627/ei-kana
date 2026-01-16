@@ -46,6 +46,17 @@ jobs:
             -derivedDataPath build \
             build
 
+      - name: Verify signature
+        run: |
+          echo "=== Code signature info ==="
+          codesign -dvv build/Build/Products/Release/ei-kana.app
+          echo ""
+          echo "=== Verify signature ==="
+          codesign --verify --deep --strict build/Build/Products/Release/ei-kana.app
+          echo ""
+          echo "=== Check Hardened Runtime ==="
+          codesign -d --entitlements - build/Build/Products/Release/ei-kana.app
+
       - name: Create ZIP
         run: |
           cd build/Build/Products/Release
@@ -57,11 +68,26 @@ jobs:
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           TEAM_ID: ${{ secrets.TEAM_ID }}
         run: |
-          xcrun notarytool submit build/Build/Products/Release/ei-kana.zip \
+          # Submit and capture the submission ID
+          RESULT=$(xcrun notarytool submit build/Build/Products/Release/ei-kana.zip \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_ID_PASSWORD" \
             --team-id "$TEAM_ID" \
-            --wait
+            --wait 2>&1) || true
+          echo "$RESULT"
+
+          # Extract submission ID
+          SUBMISSION_ID=$(echo "$RESULT" | grep "id:" | head -1 | awk '{print $2}')
+
+          # Check if notarization failed
+          if echo "$RESULT" | grep -q "status: Invalid"; then
+            echo "Notarization failed. Fetching log..."
+            xcrun notarytool log "$SUBMISSION_ID" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_ID_PASSWORD" \
+              --team-id "$TEAM_ID"
+            exit 1
+          fi
 
       - name: Staple
         run: |
