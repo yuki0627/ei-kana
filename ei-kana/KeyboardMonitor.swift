@@ -1,10 +1,28 @@
 import Cocoa
 import Carbon
 
+// 入力ソース情報
+struct InputSourceInfo: Identifiable, Hashable {
+    let id: String
+    let name: String
+}
+
 class KeyboardMonitor: ObservableObject {
     @Published var isEnabled: Bool = true {
         didSet {
             UserDefaults.standard.set(isEnabled, forKey: "isEnabled")
+        }
+    }
+
+    @Published var englishInputSourceID: String {
+        didSet {
+            UserDefaults.standard.set(englishInputSourceID, forKey: "englishInputSourceID")
+        }
+    }
+
+    @Published var japaneseInputSourceID: String {
+        didSet {
+            UserDefaults.standard.set(japaneseInputSourceID, forKey: "japaneseInputSourceID")
         }
     }
 
@@ -17,7 +35,37 @@ class KeyboardMonitor: ObservableObject {
     private let rightCommandKeyCode: CGKeyCode = 54
 
     init() {
-        isEnabled = UserDefaults.standard.object(forKey: "isEnabled") as? Bool ?? true
+        // デフォルト値を先に設定（self参照前に必要）
+        let defaultEnglish = "com.apple.keylayout.ABC"
+        let defaultJapanese = "com.google.inputmethod.Japanese"
+
+        self.englishInputSourceID = UserDefaults.standard.string(forKey: "englishInputSourceID") ?? defaultEnglish
+        self.japaneseInputSourceID = UserDefaults.standard.string(forKey: "japaneseInputSourceID") ?? defaultJapanese
+        self.isEnabled = UserDefaults.standard.object(forKey: "isEnabled") as? Bool ?? true
+    }
+
+    // 選択可能な入力ソース一覧を取得
+    func getSelectableInputSources() -> [InputSourceInfo] {
+        let conditions = [kTISPropertyInputSourceCategory: kTISCategoryKeyboardInputSource] as CFDictionary
+        guard let sources = TISCreateInputSourceList(conditions, false)?.takeRetainedValue() as? [TISInputSource] else {
+            return []
+        }
+
+        var result: [InputSourceInfo] = []
+        for source in sources {
+            if let selectablePtr = TISGetInputSourceProperty(source, kTISPropertyInputSourceIsSelectCapable) {
+                let selectable = Unmanaged<CFBoolean>.fromOpaque(selectablePtr).takeUnretainedValue() == kCFBooleanTrue
+                if !selectable { continue }
+            }
+
+            if let sourceID = TISGetInputSourceProperty(source, kTISPropertyInputSourceID),
+               let localizedName = TISGetInputSourceProperty(source, kTISPropertyLocalizedName) {
+                let id = Unmanaged<CFString>.fromOpaque(sourceID).takeUnretainedValue() as String
+                let name = Unmanaged<CFString>.fromOpaque(localizedName).takeUnretainedValue() as String
+                result.append(InputSourceInfo(id: id, name: name))
+            }
+        }
+        return result
     }
 
     func start() {
@@ -127,11 +175,11 @@ class KeyboardMonitor: ObservableObject {
     }
 
     private func switchToEnglish() {
-        switchToInputSource("ABC")
+        switchToInputSource(englishInputSourceID)
     }
 
     private func switchToJapanese() {
-        switchToInputSource("Japanese")
+        switchToInputSource(japaneseInputSourceID)
     }
 
     private func switchToInputSource(_ targetID: String) {
