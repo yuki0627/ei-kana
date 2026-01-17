@@ -2,29 +2,20 @@ import SwiftUI
 import Cocoa
 
 class AppDelegate: NSObject, NSApplicationDelegate {
-    var keyboardMonitor: KeyboardMonitor?
+    let keyboardMonitor = KeyboardMonitor()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        keyboardMonitor?.start()
+        keyboardMonitor.start()
     }
 }
 
 @main
 struct EiKanaApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    @StateObject private var keyboardMonitor = KeyboardMonitor()
-
-    init() {
-        // KeyboardMonitor will be started via AppDelegate
-    }
 
     var body: some Scene {
         MenuBarExtra {
-            MenuBarView(monitor: keyboardMonitor)
-                .onAppear {
-                    appDelegate.keyboardMonitor = keyboardMonitor
-                    keyboardMonitor.start()
-                }
+            MenuBarView(monitor: appDelegate.keyboardMonitor)
         } label: {
             Text("⌘")
         }
