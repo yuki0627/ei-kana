@@ -16,14 +16,6 @@ macOS用の英数/かな切り替えアプリ。左右のCommandキー単体押�
 
 [Releases](https://github.com/yuki0627/ei-kana/releases/) からダウンロード
 
-> **注意**: 初回起動時に「開発元を確認できない」と表示されます。
-> **右クリック → 「開く」** で起動してください。
->
-> それでも開けない場合は、ターミナルで以下を実行：
-> ```bash
-> xattr -cr /Applications/ei-kana.app
-> ```
-
 ### ソースからビルド
 
 ```bash
