@@ -19,7 +19,6 @@ ei-kana-test
 
 # Claude Code local settings
 .claude/
-CLAUDE.md
 
 # Temporary files
 *.swp
