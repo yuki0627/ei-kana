@@ -9,7 +9,7 @@ struct MenuBarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("有効")
+                Text("Enabled")
                 Spacer()
                 Toggle("", isOn: $monitor.isEnabled)
                     .labelsHidden()
@@ -17,7 +17,7 @@ struct MenuBarView: View {
             }
 
             HStack {
-                Text("ログイン時に起動")
+                Text("Launch at Login")
                 Spacer()
                 Toggle("", isOn: $launchAtLogin)
                     .labelsHidden()
@@ -30,7 +30,7 @@ struct MenuBarView: View {
             Divider()
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("英数（左⌘）")
+                Text("Left ⌘")
                     .font(.caption)
                     .foregroundColor(.secondary)
                 Picker("", selection: $monitor.englishInputSourceID) {
@@ -42,7 +42,7 @@ struct MenuBarView: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("かな（右⌘）")
+                Text("Right ⌘")
                     .font(.caption)
                     .foregroundColor(.secondary)
                 Picker("", selection: $monitor.japaneseInputSourceID) {
@@ -55,7 +55,7 @@ struct MenuBarView: View {
 
             Divider()
 
-            Button("終了") {
+            Button("Quit") {
                 NSApplication.shared.terminate(nil)
             }
             .keyboardShortcut("q")
