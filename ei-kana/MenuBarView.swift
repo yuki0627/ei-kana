@@ -8,6 +8,15 @@ struct MenuBarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            Text(monitor.monitoringStatus)
+                .font(.caption)
+                .foregroundColor(monitor.hasInputMonitoringAccess ? .secondary : .orange)
+            if !monitor.hasInputMonitoringAccess {
+                Button("Allow Input Monitoring…") {
+                    monitor.requestInputMonitoringPermission()
+                }
+            }
+
             HStack {
                 Text("Enabled")
                 Spacer()
