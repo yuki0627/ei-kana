@@ -1,5 +1,55 @@
 import Cocoa
 import Carbon
+import IOKit.hid
+
+// This local build observes keys without intercepting or recording typed input.
+// Any physical keyboard may initiate a Command tap, regardless of model or connection.
+struct CommandTapTracker {
+    struct Key: Hashable {
+        let device: UInt64
+        let page: UInt32
+        let usage: UInt32
+
+        var isCommand: Bool { page == 0x07 && (usage == 0xe3 || usage == 0xe7) }
+    }
+
+    private var held: Set<Key> = []
+    private var candidate: Key?
+
+    mutating func update(_ key: Key, pressed: Bool, eligible: Bool) -> UInt32? {
+        if pressed {
+            guard !held.contains(key) else { return nil } // Ignore duplicate / repeat reports.
+            candidate = eligible && key.isCommand && held.isEmpty ? key : nil
+            held.insert(key)
+        } else {
+            guard held.remove(key) != nil else {
+                candidate = nil // A release without an observed press cannot be a tap.
+                return nil
+            }
+            let completed = candidate == key && held.isEmpty ? key.usage : nil
+            candidate = nil
+            return completed
+        }
+        return nil
+    }
+
+    mutating func seedHeld(_ key: Key) {
+        held.insert(key)
+        candidate = nil
+    }
+
+    mutating func cancel() { candidate = nil }
+
+    mutating func removeDevice(_ device: UInt64) {
+        held = held.filter { $0.device != device }
+        candidate = nil
+    }
+
+    mutating func reset() {
+        held.removeAll()
+        candidate = nil
+    }
+}
 
 // 入力ソース情報
 struct InputSourceInfo: Identifiable, Hashable {
@@ -11,6 +61,7 @@ class KeyboardMonitor: ObservableObject {
     @Published var isEnabled: Bool = true {
         didSet {
             UserDefaults.standard.set(isEnabled, forKey: "isEnabled")
+            tapTracker.cancel()
         }
     }
 
@@ -26,13 +77,16 @@ class KeyboardMonitor: ObservableObject {
         }
     }
 
-    private var eventTap: CFMachPort?
-    private var runLoopSource: CFRunLoopSource?
-    private var lastKeyCode: CGKeyCode?
+    @Published private(set) var hasInputMonitoringAccess = false
+    @Published private(set) var monitoringStatus = "Starting keyboard monitor…"
 
-    // Key codes for Command keys
-    private let leftCommandKeyCode: CGKeyCode = 55
-    private let rightCommandKeyCode: CGKeyCode = 54
+    private var hidManager: IOHIDManager?
+    private var permissionTimer: Timer?
+    private var targetDevices: Set<UInt64> = []
+    private var knownDevices: [IOHIDDevice: UInt64] = [:]
+    private var tapTracker = CommandTapTracker()
+    private var wakeObserver: NSObjectProtocol?
+    private var mouseMonitors: [Any] = []
 
     init() {
         // デフォルト値を先に設定（self参照前に必要）
@@ -69,109 +123,178 @@ class KeyboardMonitor: ObservableObject {
     }
 
     func start() {
-        checkAccessibilityPermission()
-    }
-
-    private func checkAccessibilityPermission() {
-        let options = [kAXTrustedCheckOptionPrompt.takeRetainedValue() as String: true] as CFDictionary
-
-        if AXIsProcessTrustedWithOptions(options) {
-            startEventTap()
-        } else {
-            Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] timer in
-                if AXIsProcessTrusted() {
-                    timer.invalidate()
-                    self?.startEventTap()
-                }
-            }
+        guard permissionTimer == nil else { return }
+        // Listening needs Input Monitoring, not Accessibility or event-posting access.
+        requestInputMonitoringPermission()
+        permissionTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.refreshInputMonitoring()
+        }
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            // Do not carry a partial tap or held-key state across sleep.
+            self?.stopHIDManager()
+            self?.refreshInputMonitoring()
         }
     }
 
-    private func startEventTap() {
-        let eventMask = (1 << CGEventType.flagsChanged.rawValue) |
-                        (1 << CGEventType.keyDown.rawValue)
+    func requestInputMonitoringPermission() {
+        if !CGPreflightListenEventAccess() {
+            _ = CGRequestListenEventAccess()
+        }
+        refreshInputMonitoring()
+    }
 
-        let observer = Unmanaged.passUnretained(self).toOpaque()
-
-        eventTap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .defaultTap,
-            eventsOfInterest: CGEventMask(eventMask),
-            callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
-                guard let refcon = refcon else {
-                    return Unmanaged.passUnretained(event)
-                }
-                let monitor = Unmanaged<KeyboardMonitor>.fromOpaque(refcon).takeUnretainedValue()
-                return monitor.handleEvent(proxy: proxy, type: type, event: event)
-            },
-            userInfo: observer
-        )
-
-        guard let eventTap = eventTap else {
-            print("Failed to create event tap")
+    private func refreshInputMonitoring() {
+        hasInputMonitoringAccess = CGPreflightListenEventAccess()
+        guard hasInputMonitoringAccess else {
+            stopHIDManager()
+            monitoringStatus = "Input Monitoring permission required"
             return
         }
-
-        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
-        CGEvent.tapEnable(tap: eventTap, enable: true)
-
-        print("Event tap started")
+        if hidManager == nil { startHIDManager() }
     }
 
-    private func handleEvent(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
-        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            if let eventTap = eventTap {
-                CGEvent.tapEnable(tap: eventTap, enable: true)
+    private func startHIDManager() {
+        let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        // Watch all keyboards: keys on any keyboard must cancel a Command chord.
+        // Consumer controls are also observed so volume/media chords do not switch IME.
+        let matches: [[String: Any]] = [
+            [kIOHIDDeviceUsagePageKey: 0x01, kIOHIDDeviceUsageKey: 0x06],
+            [kIOHIDDeviceUsagePageKey: 0x0c, kIOHIDDeviceUsageKey: 0x01]
+        ]
+        IOHIDManagerSetDeviceMatchingMultiple(manager, matches as CFArray)
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        IOHIDManagerRegisterDeviceMatchingCallback(manager, { context, result, _, device in
+            guard result == kIOReturnSuccess, let context = context else { return }
+            Unmanaged<KeyboardMonitor>.fromOpaque(context).takeUnretainedValue().deviceAdded(device)
+        }, context)
+        IOHIDManagerRegisterDeviceRemovalCallback(manager, { context, _, _, device in
+            guard let context = context else { return }
+            Unmanaged<KeyboardMonitor>.fromOpaque(context).takeUnretainedValue().deviceRemoved(device)
+        }, context)
+        IOHIDManagerRegisterInputValueCallback(manager, { context, result, _, value in
+            guard let context = context else { return }
+            let monitor = Unmanaged<KeyboardMonitor>.fromOpaque(context).takeUnretainedValue()
+            guard result == kIOReturnSuccess else {
+                monitor.tapTracker.cancel()
+                return
             }
-            return Unmanaged.passUnretained(event)
+            monitor.handleValue(value)
+        }, context)
+        hidManager = manager
+        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+        // Never use kIOHIDOptionsTypeSeizeDevice: normal key delivery stays with macOS.
+        let result = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        guard result == kIOReturnSuccess else {
+            stopHIDManager()
+            monitoringStatus = "Keyboard monitor unavailable (\(result)); retrying…"
+            return
         }
-
-        guard isEnabled else {
-            return Unmanaged.passUnretained(event)
+        let mouseDowns: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        if let observer = NSEvent.addGlobalMonitorForEvents(matching: mouseDowns, handler: { [weak self] _ in
+            self?.tapTracker.cancel()
+        }) { mouseMonitors.append(observer) }
+        if let observer = NSEvent.addLocalMonitorForEvents(matching: mouseDowns, handler: { [weak self] event in
+            self?.tapTracker.cancel()
+            return event
+        }) { mouseMonitors.append(observer) }
+        if let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> {
+            for device in devices { deviceAdded(device) }
         }
-
-        switch type {
-        case .flagsChanged:
-            return handleFlagsChanged(event: event)
-        case .keyDown:
-            lastKeyCode = nil
-            return Unmanaged.passUnretained(event)
-        default:
-            return Unmanaged.passUnretained(event)
-        }
+        updateMonitoringStatus()
     }
 
-    private func handleFlagsChanged(event: CGEvent) -> Unmanaged<CGEvent>? {
-        let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-        let flags = event.flags
-
-        guard keyCode == leftCommandKeyCode || keyCode == rightCommandKeyCode else {
-            lastKeyCode = nil
-            return Unmanaged.passUnretained(event)
+    private func deviceID(_ device: IOHIDDevice) -> UInt64? {
+        if let identifier = knownDevices[device] { return identifier }
+        var identifier: UInt64 = 0
+        guard IORegistryEntryGetRegistryEntryID(IOHIDDeviceGetService(device), &identifier) == KERN_SUCCESS else {
+            return nil // Unknown origin must never initiate a switch.
         }
+        return identifier
+    }
 
-        let isCommandPressed = flags.contains(.maskCommand)
+    private func isTargetDevice(_ device: IOHIDDevice) -> Bool {
+        return IOHIDDeviceConformsTo(device, 0x01, 0x06)
+    }
 
-        if isCommandPressed {
-            lastKeyCode = keyCode
-        } else {
-            if lastKeyCode == keyCode {
-                // 非同期で切り替えを実行（イベントタップをブロックしないため）
-                let isLeftCommand = keyCode == leftCommandKeyCode
-                DispatchQueue.main.async { [weak self] in
-                    if isLeftCommand {
-                        self?.switchToEnglish()
-                    } else {
-                        self?.switchToJapanese()
+    private func deviceAdded(_ device: IOHIDDevice) {
+        guard knownDevices[device] == nil else { return }
+        guard let identifier = deviceID(device) else { return }
+        knownDevices[device] = identifier
+        tapTracker.cancel()
+        if isTargetDevice(device) { targetDevices.insert(identifier) }
+        // Seed cached physical state, including keys already down when the app starts.
+        if let elements = IOHIDDeviceCopyMatchingElements(device, nil, IOOptionBits(kIOHIDOptionsTypeNone)) as? [IOHIDElement] {
+            for element in elements {
+                guard (1...4).contains(IOHIDElementGetType(element).rawValue) else { continue }
+                let page = IOHIDElementGetUsagePage(element)
+                let usage = IOHIDElementGetUsage(element)
+                guard isTrackedKey(page: page, usage: usage) else { continue }
+                withUnsafeTemporaryAllocation(of: Unmanaged<IOHIDValue>.self, capacity: 1) { buffer in
+                    guard let pointer = buffer.baseAddress,
+                          IOHIDDeviceGetValue(device, element, pointer) == kIOReturnSuccess else { return }
+                    let value = pointer.pointee.takeUnretainedValue()
+                    if IOHIDValueGetLength(value) <= MemoryLayout<CFIndex>.size,
+                       IOHIDValueGetIntegerValue(value) != 0 {
+                        tapTracker.seedHeld(.init(device: identifier, page: page, usage: usage))
                     }
                 }
             }
-            lastKeyCode = nil
         }
+        updateMonitoringStatus()
+    }
 
-        return Unmanaged.passUnretained(event)
+    private func deviceRemoved(_ device: IOHIDDevice) {
+        if let identifier = deviceID(device) {
+            targetDevices.remove(identifier)
+            tapTracker.removeDevice(identifier)
+            knownDevices.removeValue(forKey: device)
+        } else {
+            tapTracker.cancel()
+        }
+        updateMonitoringStatus()
+    }
+
+    private func updateMonitoringStatus() {
+        monitoringStatus = targetDevices.isEmpty ? "Waiting for a keyboard" : "Ready"
+    }
+
+    private func isTrackedKey(page: UInt32, usage: UInt32) -> Bool {
+        (page == 0x07 && (0x04...0xe7).contains(usage)) || (page == 0x0c && usage != 0)
+    }
+
+    private func handleValue(_ value: IOHIDValue) {
+        let element = IOHIDValueGetElement(value)
+        let device = IOHIDElementGetDevice(element)
+        guard let identifier = deviceID(device) else {
+            tapTracker.cancel()
+            return
+        }
+        guard IOHIDValueGetLength(value) <= MemoryLayout<CFIndex>.size else {
+            tapTracker.cancel()
+            return
+        }
+        let page = IOHIDElementGetUsagePage(element)
+        let usage = IOHIDElementGetUsage(element)
+        let pressed = IOHIDValueGetIntegerValue(value) != 0
+        guard isTrackedKey(page: page, usage: usage) else {
+            // Vendor-defined Fn / other controls may not have a standard keyboard usage.
+            if pressed { tapTracker.cancel() }
+            return
+        }
+        let key = CommandTapTracker.Key(device: identifier, page: page, usage: usage)
+        // Also reject Fn / modifiers already held before monitoring began. Command
+        // itself is excluded because this event's own physical press sets that flag.
+        let otherModifiers: CGEventFlags = [.maskShift, .maskControl, .maskAlternate, .maskSecondaryFn]
+        let noOtherModifiers = CGEventSource.flagsState(.combinedSessionState).intersection(otherModifiers).isEmpty
+        let eligible = isEnabled && targetDevices.contains(identifier) && noOtherModifiers && NSEvent.pressedMouseButtons == 0
+        guard let command = tapTracker.update(key, pressed: pressed, eligible: eligible), eligible else { return }
+        // Keep the HID callback short; queued work must still be enabled and connected.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.isEnabled, self.targetDevices.contains(identifier) else { return }
+            if command == 0xe3 { self.switchToEnglish() } else { self.switchToJapanese() }
+        }
     }
 
     private func switchToEnglish() {
@@ -188,26 +311,35 @@ class KeyboardMonitor: ObservableObject {
             return
         }
 
-        for source in sources {
-            // 選択可能なソースのみ対象
-            if let selectablePtr = TISGetInputSourceProperty(source, kTISPropertyInputSourceIsSelectCapable) {
-                let selectable = Unmanaged<CFBoolean>.fromOpaque(selectablePtr).takeUnretainedValue() == kCFBooleanTrue
-                if !selectable { continue }
-            }
-
-            if let sourceID = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) {
-                let id = Unmanaged<CFString>.fromOpaque(sourceID).takeUnretainedValue() as String
-                if id.contains(targetID) {
-                    TISSelectInputSource(source)
-
-                    // CJKV言語の場合はワークアラウンドを適用（Electronアプリ対策）
-                    if isCJKV(targetID) {
-                        showTemporaryInputWindow()
-                    }
-                    return
+        let selectableSources: [(String, TISInputSource)] = sources.compactMap { source in
+            guard let selectable = TISGetInputSourceProperty(source, kTISPropertyInputSourceIsSelectCapable),
+                  Unmanaged<CFBoolean>.fromOpaque(selectable).takeUnretainedValue() == kCFBooleanTrue,
+                  let sourceID = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else { return nil }
+            return (Unmanaged<CFString>.fromOpaque(sourceID).takeUnretainedValue() as String, source)
+        }
+        // Exact IDs distinguish Google Hiragana (.base) from Alphanumeric (.Roman).
+        // Retain only the old Google parent-ID fallback, with an explicit mode order.
+        let fallbackIDs = targetID == "com.google.inputmethod.Japanese" ? [
+            "com.google.inputmethod.Japanese.base", "com.google.inputmethod.Japanese.Roman"
+        ] : []
+        for identifier in [targetID] + fallbackIDs {
+            if let (_, source) = selectableSources.first(where: { $0.0 == identifier }) {
+                let current = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
+                if inputSourceString(current, kTISPropertyInputSourceID) == identifier { return }
+                let currentProvider = inputSourceString(current, kTISPropertyBundleID)
+                let targetProvider = inputSourceString(source, kTISPropertyBundleID)
+                let sameIME = currentProvider != nil && currentProvider == targetProvider
+                if TISSelectInputSource(source) == noErr && isCJKV(identifier) && !sameIME {
+                    showTemporaryInputWindow()
                 }
+                return
             }
         }
+    }
+
+    private func inputSourceString(_ source: TISInputSource, _ property: CFString) -> String? {
+        guard let value = TISGetInputSourceProperty(source, property) else { return nil }
+        return Unmanaged<CFString>.fromOpaque(value).takeUnretainedValue() as String
     }
 
     // CJKV（中国語・日本語・韓国語・ベトナム語）かどうかを判定
@@ -267,15 +399,32 @@ class KeyboardMonitor: ObservableObject {
         }
     }
 
+    private func stopHIDManager() {
+        for observer in mouseMonitors { NSEvent.removeMonitor(observer) }
+        mouseMonitors.removeAll()
+        if let manager = hidManager {
+            IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+            IOHIDManagerRegisterInputValueCallback(manager, nil, nil)
+            IOHIDManagerRegisterDeviceMatchingCallback(manager, nil, nil)
+            IOHIDManagerRegisterDeviceRemovalCallback(manager, nil, nil)
+            IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        }
+        hidManager = nil
+        targetDevices.removeAll()
+        knownDevices.removeAll()
+        tapTracker.reset()
+    }
+
     func stop() {
-        if let eventTap = eventTap {
-            CGEvent.tapEnable(tap: eventTap, enable: false)
+        permissionTimer?.invalidate()
+        permissionTimer = nil
+        if let wakeObserver = wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
         }
-        if let runLoopSource = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
-        }
-        eventTap = nil
-        runLoopSource = nil
+        wakeObserver = nil
+        stopHIDManager()
+        tempWindow?.orderOut(nil)
+        tempWindow = nil
     }
 
     deinit {
