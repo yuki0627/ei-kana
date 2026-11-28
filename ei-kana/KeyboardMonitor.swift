@@ -326,10 +326,9 @@ class KeyboardMonitor: ObservableObject {
             if let (_, source) = selectableSources.first(where: { $0.0 == identifier }) {
                 let current = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
                 if inputSourceString(current, kTISPropertyInputSourceID) == identifier { return }
-                let currentProvider = inputSourceString(current, kTISPropertyBundleID)
-                let targetProvider = inputSourceString(source, kTISPropertyBundleID)
-                let sameIME = currentProvider != nil && currentProvider == targetProvider
-                if TISSelectInputSource(source) == noErr && isCJKV(identifier) && !sameIME {
+                // Apply the workaround even within one IME (e.g. Google Alphanumeric -> Hiragana):
+                // Electron apps such as Slack miss that mode change too.
+                if TISSelectInputSource(source) == noErr && isCJKV(identifier) {
                     showTemporaryInputWindow()
                 }
                 return
